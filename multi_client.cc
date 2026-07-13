@@ -12,6 +12,7 @@
 
 int g_sock = -1;
 volatile sig_atomic_t g_running = 1;
+pthread_mutex_t g_output_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void error_handling(const char* message)
 {
@@ -37,8 +38,14 @@ void* recv_thread(void* arg)
 
     while(g_running && (len = read(sock, msg, sizeof(msg) - 1)) > 0){
         msg[len] = '\0';
+        pthread_mutex_lock(&g_output_mutex);
         fputs(msg, stdout);
         fflush(stdout);
+        if(g_running){
+            fputs("> ", stdout);
+            fflush(stdout);
+        }
+        pthread_mutex_unlock(&g_output_mutex);
     }
 
     g_running = 0;
@@ -58,6 +65,11 @@ void* send_thread(void* arg)
         if(strncmp(msg, "/quit", 5) == 0){
             break;
         }
+
+        pthread_mutex_lock(&g_output_mutex);
+        fputs("> ", stdout);
+        fflush(stdout);
+        pthread_mutex_unlock(&g_output_mutex);
     }
 
     g_running = 0;
@@ -78,7 +90,8 @@ int main(int argc, char* argv[])
       설계 포인트:
       1) 송신/수신을 각각 별도 스레드로 분리하여, 입력 대기 중에도 서버 메시지를 즉시 출력한다.
       2) 닉네임은 연결 직후 "/nick 이름" 명령으로 서버에 전달한다.
-      3) 종료는 /quit 또는 Ctrl+C 로 처리한다.
+    3) /help 로 사용 가능한 명령어를 다시 확인할 수 있다.
+    4) 종료는 /quit 또는 Ctrl+C 로 처리한다.
     */
     if(argc < 3 || argc > 4){
         printf("Usage: %s <IP> <PORT> [NICKNAME]\n", argv[0]);
@@ -115,7 +128,9 @@ int main(int argc, char* argv[])
     }
 
     printf("Connected: %s:%s\n", argv[1], argv[2]);
-    printf("Commands: /nick <name>, /w <name> <msg>, /who, /quit\n");
+    printf("Commands: /nick <name>, /w <name> <msg>, /who, /help, /quit\n");
+    printf("> ");
+    fflush(stdout);
 
     pthread_create(&rcv_t, NULL, recv_thread, (void*)&sock);
     pthread_create(&snd_t, NULL, send_thread, (void*)&sock);
