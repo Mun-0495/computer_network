@@ -11,6 +11,10 @@
 #define BUFSIZE 1024
 #define MAX_CLIENT  64
 #define NICK_LEN 32
+#define HISTORY_FILE "chat_history.log"
+#define RECENT_HISTORY_COUNT 10
+#define SEARCH_RESULT_LIMIT 20
+#define LOG_LINE_LEN 1536
 
 typedef struct {
     int sock;
@@ -26,6 +30,7 @@ typedef struct {
 client_info_t clients[MAX_CLIENT];
 int clnt_count = 0;
 pthread_mutex_t clnt_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void error_handling(const char *message)
 {
@@ -60,6 +65,23 @@ void send_to_sock(int sock, const char* msg)
     write(sock, msg, strlen(msg));
 }
 
+void append_history_line(const char* line)
+{
+    FILE* fp;
+
+    if(line == NULL || line[0] == '\0'){
+        return;
+    }
+
+    pthread_mutex_lock(&log_mutex);
+    fp = fopen(HISTORY_FILE, "a");
+    if(fp != NULL){
+        fputs(line, fp);
+        fclose(fp);
+    }
+    pthread_mutex_unlock(&log_mutex);
+}
+
 void broadcast_message(const char* msg, int exclude_sock);
 
 int is_nick_taken(const char* nick)
@@ -90,6 +112,7 @@ void broadcast_system_message(const char* message, int exclude_sock)
 
     make_time_prefix(timebuf, sizeof(timebuf));
     snprintf(line, sizeof(line), "%s [SYSTEM] %s\n", timebuf, message);
+    append_history_line(line);
     broadcast_message(line, exclude_sock);
 }
 
@@ -100,6 +123,18 @@ void broadcast_chat_message(const char* nick, const char* message, int exclude_s
 
     make_time_prefix(timebuf, sizeof(timebuf));
     snprintf(line, sizeof(line), "%s [%s] %s\n", timebuf, nick, message);
+    append_history_line(line);
+    broadcast_message(line, exclude_sock);
+}
+
+void broadcast_action_message(const char* nick, const char* action, int exclude_sock)
+{
+    char timebuf[16];
+    char line[BUFSIZE + NICK_LEN + 32];
+
+    make_time_prefix(timebuf, sizeof(timebuf));
+    snprintf(line, sizeof(line), "%s * %s %s\n", timebuf, nick, action);
+    append_history_line(line);
     broadcast_message(line, exclude_sock);
 }
 
@@ -183,25 +218,37 @@ int change_nick(int sock, const char* new_nick, char* old_nick)
 {
     int i;
     int updated = 0;
+    int current_idx = -1;
 
     pthread_mutex_lock(&clnt_mutex);
-    if(is_nick_taken(new_nick)){
+    for(i = 0; i < clnt_count; i++){
+        if(clients[i].sock == sock){
+            current_idx = i;
+            break;
+        }
+    }
+
+    if(current_idx < 0){
         pthread_mutex_unlock(&clnt_mutex);
         return 0;
     }
 
     for(i = 0; i < clnt_count; i++){
-        if(clients[i].sock == sock){
-            if(old_nick != NULL){
-                strncpy(old_nick, clients[i].nick, NICK_LEN - 1);
-                old_nick[NICK_LEN - 1] = '\0';
-            }
-            strncpy(clients[i].nick, new_nick, NICK_LEN - 1);
-            clients[i].nick[NICK_LEN - 1] = '\0';
-            updated = 1;
-            break;
+        if(i != current_idx && strcmp(clients[i].nick, new_nick) == 0){
+            pthread_mutex_unlock(&clnt_mutex);
+            return 0;
         }
     }
+
+    if(old_nick != NULL){
+        strncpy(old_nick, clients[current_idx].nick, NICK_LEN - 1);
+        old_nick[NICK_LEN - 1] = '\0';
+    }
+
+    strncpy(clients[current_idx].nick, new_nick, NICK_LEN - 1);
+    clients[current_idx].nick[NICK_LEN - 1] = '\0';
+    updated = 1;
+
     pthread_mutex_unlock(&clnt_mutex);
 
     return updated;
@@ -248,9 +295,98 @@ void send_help_message(int requester_sock)
     send_system_message(requester_sock, "도움말 / 기능 안내");
     send_system_message(requester_sock, "/nick 이름 : 닉네임 변경");
     send_system_message(requester_sock, "/w 닉네임 내용 : 귓속말");
+    send_system_message(requester_sock, "/me 행동 : 액션 메시지");
+    send_system_message(requester_sock, "/search 키워드 : 과거 메시지 검색");
     send_system_message(requester_sock, "/who : 접속자 목록 확인");
     send_system_message(requester_sock, "/help : 명령어 목록 다시 보기");
     send_system_message(requester_sock, "/quit : 종료");
+}
+
+void send_room_summary(int requester_sock, const char* my_nick)
+{
+    char line[BUFSIZE];
+
+    pthread_mutex_lock(&clnt_mutex);
+    snprintf(line, sizeof(line), "현재 접속자 수: %d명", clnt_count);
+    pthread_mutex_unlock(&clnt_mutex);
+
+    send_system_message(requester_sock, "===== 방 상태 요약 =====");
+    send_system_message(requester_sock, line);
+    snprintf(line, sizeof(line), "내 닉네임: %s", my_nick);
+    send_system_message(requester_sock, line);
+    send_system_message(requester_sock, "최근 대화와 명령어를 바로 확인할 수 있습니다.");
+    send_system_message(requester_sock, "=====================");
+}
+
+void send_recent_history(int requester_sock)
+{
+    FILE* fp;
+    char lines[RECENT_HISTORY_COUNT][LOG_LINE_LEN];
+    int count = 0;
+    int start;
+    int i;
+
+    pthread_mutex_lock(&log_mutex);
+    fp = fopen(HISTORY_FILE, "r");
+    if(fp != NULL){
+        while(fgets(lines[count % RECENT_HISTORY_COUNT], sizeof(lines[0]), fp) != NULL){
+            count++;
+        }
+        fclose(fp);
+    }
+    pthread_mutex_unlock(&log_mutex);
+
+    if(count == 0){
+        send_system_message(requester_sock, "저장된 최근 대화가 없습니다.");
+        return;
+    }
+
+    send_system_message(requester_sock, "===== 최근 대화 =====");
+    start = (count > RECENT_HISTORY_COUNT) ? (count - RECENT_HISTORY_COUNT) : 0;
+    for(i = start; i < count; i++){
+        send_to_sock(requester_sock, lines[i % RECENT_HISTORY_COUNT]);
+    }
+    send_system_message(requester_sock, "=====================");
+}
+
+void send_search_history(int requester_sock, const char* query)
+{
+    FILE* fp;
+    char line[LOG_LINE_LEN];
+    int matches = 0;
+
+    if(query == NULL || *query == '\0'){
+        send_system_message(requester_sock, "사용법: /search 키워드");
+        return;
+    }
+
+    pthread_mutex_lock(&log_mutex);
+    fp = fopen(HISTORY_FILE, "r");
+    if(fp == NULL){
+        pthread_mutex_unlock(&log_mutex);
+        send_system_message(requester_sock, "저장된 채팅 로그가 없습니다.");
+        return;
+    }
+
+    send_system_message(requester_sock, "===== 검색 결과 =====");
+    while(fgets(line, sizeof(line), fp) != NULL){
+        if(strstr(line, query) != NULL){
+            send_to_sock(requester_sock, line);
+            matches++;
+            if(matches >= SEARCH_RESULT_LIMIT){
+                break;
+            }
+        }
+    }
+    fclose(fp);
+    pthread_mutex_unlock(&log_mutex);
+
+    if(matches == 0){
+        send_system_message(requester_sock, "검색 결과가 없습니다.");
+    } else if(matches >= SEARCH_RESULT_LIMIT){
+        send_system_message(requester_sock, "검색 결과가 너무 많아 일부만 표시했습니다.");
+    }
+    send_system_message(requester_sock, "=====================");
 }
 
 int process_line_message(int clnt_sock, char* msg, char* my_nick)
@@ -273,6 +409,11 @@ int process_line_message(int clnt_sock, char* msg, char* my_nick)
             return 1;
         }
 
+        if(strcmp(my_nick, new_nick) == 0){
+            send_system_message(clnt_sock, "이미 현재 사용 중인 닉네임입니다.");
+            return 1;
+        }
+
         if(change_nick(clnt_sock, new_nick, old_nick)){
             strncpy(my_nick, new_nick, NICK_LEN - 1);
             my_nick[NICK_LEN - 1] = '\0';
@@ -281,6 +422,22 @@ int process_line_message(int clnt_sock, char* msg, char* my_nick)
         } else {
             send_system_message(clnt_sock, "이미 사용 중인 닉네임입니다.");
         }
+        return 1;
+    }
+
+    if(strncmp(msg, "/me ", 4) == 0){
+        char* action = msg + 4;
+
+        while(*action == ' '){
+            action++;
+        }
+
+        if(strlen(action) == 0){
+            send_system_message(clnt_sock, "사용법: /me 행동");
+            return 1;
+        }
+
+        broadcast_action_message(my_nick, action, -1);
         return 1;
     }
 
@@ -325,6 +482,17 @@ int process_line_message(int clnt_sock, char* msg, char* my_nick)
         if(target_sock != clnt_sock){
             send_system_message(clnt_sock, pm_msg);
         }
+        return 1;
+    }
+
+    if(strncmp(msg, "/search ", 8) == 0){
+        char* query = msg + 8;
+
+        while(*query == ' '){
+            query++;
+        }
+
+        send_search_history(clnt_sock, query);
         return 1;
     }
 
@@ -373,6 +541,8 @@ void* handle_clnt(void* arg)
 
     send_system_message(clnt_sock, "채팅 서버에 연결되었습니다.");
     send_system_message(clnt_sock, "명령어: /nick 이름, /w 대상 내용, /who, /help, /quit");
+    send_room_summary(clnt_sock, my_nick);
+    send_recent_history(clnt_sock);
 
     snprintf(join_msg, sizeof(join_msg), "%s 님이 입장했습니다. (%s:%d)",
              my_nick, ip_str, ntohs(clnt_addr.sin_port));
